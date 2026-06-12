@@ -6,6 +6,7 @@ set -euo pipefail
 
 SYNC_DIR="${MNEMON_VAULT_DIR:-$HOME/.mnemon-vault}"
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/mnemon-vault/config"
+IDENTITY_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/mnemon-vault/identity.txt"
 DB_TEAM="${MNEMON_DB_TEAM:-$HOME/.mnemon/data/team/mnemon.db}"
 DB_PERSONAL="${MNEMON_DB_PERSONAL:-$HOME/.mnemon/data/personal/mnemon.db}"
 DEVICE="$(hostname -s)-$(id -un)"
@@ -50,24 +51,41 @@ _require_config() {
 
 _fetch_keys() {
     local user="$1"
-    local keys
+    local keys usable recipients_file recipients_lines combined
+
+    # Source (a): age-compatible ssh keys from the git host
     keys=$(curl "${CURL_OPTS[@]}" "${GIT_HOST_URL}/${user}.keys" 2>/dev/null) || {
         echo "[mnemon-vault] WARNING: could not fetch keys for ${user}" >&2
-        return 1
+        keys=""
     }
-    if [ -z "$keys" ]; then
-        echo "[mnemon-vault] WARNING: no keys found for ${user} on git host" >&2
-        return 1
-    fi
     # age accepts only ssh-ed25519 and ssh-rsa recipients. Drop anything else
     # (ecdsa, sk-*, dss) so one member's unsupported key can't break the whole push.
-    local usable
     usable=$(printf '%s\n' "$keys" | grep -E '^(ssh-ed25519|ssh-rsa) ' || true)
-    if [ -z "$usable" ]; then
-        echo "[mnemon-vault] WARNING: ${user} has no age-compatible key (need ed25519 or rsa)" >&2
+
+    # Source (b): age recipients from $SYNC_DIR/recipients/<user>.txt
+    recipients_file="$SYNC_DIR/recipients/${user}.txt"
+    recipients_lines=""
+    if [ -f "$recipients_file" ]; then
+        # Accept only native age recipients (age1…) so one member's bad line can't break the whole push.
+        recipients_lines=$(grep -E '^age1' "$recipients_file" || true)
+    fi
+
+    combined=""
+    [ -n "$usable" ] && combined="$usable"
+    if [ -n "$recipients_lines" ]; then
+        if [ -n "$combined" ]; then
+            combined="${combined}
+${recipients_lines}"
+        else
+            combined="$recipients_lines"
+        fi
+    fi
+
+    if [ -z "$combined" ]; then
+        echo "[mnemon-vault] WARNING: ${user} has no usable recipient (need an ed25519/rsa key on the git host, or age1 lines in recipients/${user}.txt)" >&2
         return 1
     fi
-    echo "$usable"
+    echo "$combined"
 }
 
 # Probe the git host before any git/curl network work. Off-VPN / offline
@@ -266,6 +284,20 @@ print(c.execute('SELECT COUNT(*) FROM insights WHERE deleted_at IS NULL').fetcho
     echo "[mnemon-vault] pushed (team: ${n} insights, device: ${DEVICE})" >&2
 }
 
+_decrypt_with_candidates() {
+    # Try each identity candidate in order; stop at first success.
+    # Usage: _decrypt_with_candidates <output_tmp> <encrypted_file> <candidate>...
+    local out="$1" enc="$2"
+    shift 2
+    local candidate
+    for candidate in "$@"; do
+        if age --decrypt -i "$candidate" -o "$out" "$enc" 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 cmd_pull() {
     _require_age
     _require_config
@@ -277,25 +309,33 @@ cmd_pull() {
         echo "[mnemon-vault] ${GIT_HOST_URL} unreachable — importing local files only" >&2
     fi
 
-    # Collect every available SSH private key as an age identity. age tries each
-    # in turn, so a device with multiple keys (ed25519 + rsa) decrypts regardless
-    # of which key the file was encrypted to.
-    local -a age_ids=()
+    # Build an ordered list of identity candidates.
+    # Plugin identity first (no passphrase prompt needed), then SSH key files.
+    local -a id_candidates=()
+    if [ -f "$IDENTITY_FILE" ]; then
+        if command -v age-plugin-sshagent &>/dev/null; then
+            id_candidates+=("$IDENTITY_FILE")
+        else
+            echo "[mnemon-vault] WARNING: identity file found but age-plugin-sshagent is not in PATH — install it to decrypt via ssh-agent" >&2
+        fi
+    fi
     for k in ~/.ssh/id_ed25519 ~/.ssh/id_rsa ~/.ssh/id_ed25519_sk; do
-        [ -f "$k" ] && age_ids+=(-i "$k")
+        [ -f "$k" ] && id_candidates+=("$k")
     done
-    if [ ${#age_ids[@]} -eq 0 ]; then
+    if [ ${#id_candidates[@]} -eq 0 ]; then
         echo "[mnemon-vault] ERROR: no SSH private key found in ~/.ssh (id_ed25519 / id_rsa)" >&2
         exit 1
     fi
 
     # Import team memories (all devices)
-    local team_count=0
+    local team_total=0 team_decrypted=0 team_count=0
     for f in "$SYNC_DIR/data/team/"*.json.age; do
         [ -f "$f" ] || continue
+        team_total=$((team_total + 1))
         local tmp
         tmp=$(mktemp /tmp/mnemon-team-XXXXXX.json)
-        if age --decrypt "${age_ids[@]}" -o "$tmp" "$f" 2>/dev/null; then
+        if _decrypt_with_candidates "$tmp" "$f" "${id_candidates[@]}"; then
+            team_decrypted=$((team_decrypted + 1))
             if MNEMON_STORE=team mnemon import "$tmp" > /dev/null 2>&1; then team_count=$((team_count + 1)); fi
         else
             echo "[mnemon-vault] WARNING: could not decrypt $(basename "$f") with your keys" >&2
@@ -309,7 +349,7 @@ cmd_pull() {
     if [ -f "$personal_file" ]; then
         local tmp
         tmp=$(mktemp /tmp/mnemon-personal-XXXXXX.json)
-        if age --decrypt "${age_ids[@]}" -o "$tmp" "$personal_file" 2>/dev/null; then
+        if _decrypt_with_candidates "$tmp" "$personal_file" "${id_candidates[@]}"; then
             if MNEMON_STORE=personal mnemon import "$tmp" > /dev/null 2>&1; then personal_count=1; fi
         else
             echo "[mnemon-vault] WARNING: could not decrypt personal file with your keys" >&2
@@ -318,6 +358,11 @@ cmd_pull() {
     fi
 
     echo "[mnemon-vault] pulled (team: ${team_count} device files, personal: ${personal_count})" >&2
+
+    # Loud actionable warning to STDOUT (not stderr) so SessionStart hook captures it.
+    if [ "$team_total" -gt 0 ] && [ "$team_decrypted" -eq 0 ]; then
+        echo "[mnemon-vault] WARNING: 0 of ${team_total} team memory files could be decrypted. If your ssh key has a passphrase, run: mnemon-vault setup-agent"
+    fi
 
     # Output routing guide for model to read this session
     [ -f "$SYNC_DIR/guide.md" ] && cat "$SYNC_DIR/guide.md"
@@ -390,21 +435,67 @@ cmd_keygen() {
     echo "After adding to your git host, run: mnemon-vault configure"
 }
 
+cmd_setup_agent() {
+    _require_config
+
+    if ! command -v age-plugin-sshagent &>/dev/null; then
+        echo "[mnemon-vault] ERROR: 'age-plugin-sshagent' not found." >&2
+        echo "[mnemon-vault] Install: go install github.com/eszio/age-plugin-sshagent@latest" >&2
+        echo "[mnemon-vault]   or download from https://github.com/eszio/age-plugin-sshagent/releases" >&2
+        exit 1
+    fi
+
+    local identity_dir
+    identity_dir="$(dirname "$IDENTITY_FILE")"
+    mkdir -p "$identity_dir"
+
+    if [ ! -f "$IDENTITY_FILE" ]; then
+        age-plugin-sshagent keygen -o "$IDENTITY_FILE" "$@"
+    fi
+
+    local recipient
+    recipient=$(age-plugin-sshagent recipient -i "$IDENTITY_FILE")
+
+    local recipients_file="$SYNC_DIR/recipients/${GIT_HOST_USER}.txt"
+    mkdir -p "$(dirname "$recipients_file")"
+
+    if grep -qxF "$recipient" "$recipients_file" 2>/dev/null; then
+        echo "[mnemon-vault] recipient already present in ${recipients_file}"
+    else
+        echo "$recipient" >> "$recipients_file"
+        git -C "$SYNC_DIR" add "recipients/${GIT_HOST_USER}.txt"
+        if git -C "$SYNC_DIR" commit -m "chore(recipients): add sshagent recipient for ${GIT_HOST_USER} (${DEVICE})"; then
+            if ! git -C "$SYNC_DIR" push origin main --quiet 2>/dev/null; then
+                echo "[mnemon-vault] WARNING: could not push to origin — run 'git -C $SYNC_DIR push' when online" >&2
+            fi
+        fi
+    fi
+
+    echo ""
+    echo "Identity file : $IDENTITY_FILE"
+    echo "Recipient     : $recipient"
+    echo ""
+    echo "Teammates' next push will encrypt to this recipient automatically."
+    echo "Run 'mnemon-vault pull' to decrypt using your ssh-agent."
+}
+
 case "${1:-help}" in
-    push)       cmd_push ;;
-    pull)       cmd_pull ;;
-    status)     cmd_status ;;
-    configure)  cmd_configure ;;
-    update)     cmd_update ;;
-    keygen)     cmd_keygen ;;
+    push)         cmd_push ;;
+    pull)         cmd_pull ;;
+    status)       cmd_status ;;
+    configure)    cmd_configure ;;
+    update)       cmd_update ;;
+    keygen)       cmd_keygen ;;
+    setup-agent)  shift; cmd_setup_agent "$@" ;;
     *)
         echo "Usage: mnemon-vault <command>"
         echo ""
-        echo "  configure  — set git host URL and username for this machine (run once)"
-        echo "  push       — export memories → encrypt → git push"
-        echo "  pull       — git pull → decrypt → import into mnemon"
-        echo "  status     — show sync state"
-        echo "  update     — pull tooling updates from the public template into your team repo"
-        echo "  keygen     — show SSH keys to register on your git host"
+        echo "  configure    — set git host URL and username for this machine (run once)"
+        echo "  push         — export memories → encrypt → git push"
+        echo "  pull         — git pull → decrypt → import into mnemon"
+        echo "  status       — show sync state"
+        echo "  update       — pull tooling updates from the public template into your team repo"
+        echo "  keygen       — show SSH keys to register on your git host"
+        echo "  setup-agent  — use an ssh-agent-derived identity for decryption (requires age-plugin-sshagent)"
         ;;
 esac
