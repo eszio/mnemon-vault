@@ -7,3 +7,6 @@ members.txt
 
 # Per-machine config (not shared)
 *.local
+
+# SessionEnd hook log (per-machine)
+push.log

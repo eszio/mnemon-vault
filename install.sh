@@ -7,6 +7,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="${HOME}/.local/bin"
 SETTINGS_FILE="${HOME}/.claude/settings.json"
 
+# --hooks-only: apply only the Claude Code settings/hook migrations (step 5).
+# Used by `mnemon-vault update` — non-interactive, safe to re-run anytime.
+HOOKS_ONLY=0
+[ "${1:-}" = "--hooks-only" ] && HOOKS_ONLY=1
+
+if [ "$HOOKS_ONLY" -eq 0 ]; then
+
 echo "=== mnemon-vault install ==="
 echo ""
 
@@ -79,6 +86,8 @@ echo "  Your SSH public keys must be registered there."
 echo ""
 "$SCRIPT_DIR/mnemon-vault" configure
 
+fi  # end of full-install-only steps
+
 # 5. Wire Claude Code hooks + env
 echo "[5/5] Wiring Claude Code hooks in ${SETTINGS_FILE}..."
 python3 - "$SETTINGS_FILE" "$SCRIPT_DIR" <<'PYEOF'
@@ -109,20 +118,37 @@ if not any("mnemon-vault pull" in str(h) for h in session_start):
 else:
     print("  SessionStart hook already present")
 
-# SessionEnd: mnemon-vault push
+# SessionEnd: mnemon-vault push — detached, so the hook returns immediately.
+# A blocking push gets cancelled by Claude Code when the network is slow or
+# the app quits before it finishes ("Hook cancelled").
+# Use literal $HOME (expanded by the shell at hook runtime), never this
+# clone's absolute path — keeps the migration idempotent no matter where
+# install.sh runs from.
 session_end = hooks.setdefault("SessionEnd", [])
-push_cmd = "$HOME/.local/bin/mnemon-vault push 2>/dev/null || true"
-if not any("mnemon-vault push" in str(h) for h in session_end):
+push_cmd = "($HOME/.local/bin/mnemon-vault push >$HOME/.mnemon-vault/push.log 2>&1 &)"
+existing = [h for h in session_end if "mnemon-vault push" in str(h)]
+if not existing:
     session_end.append({"hooks": [{"type": "command", "command": push_cmd}]})
-    print("  Added SessionEnd hook: mnemon-vault push")
+    print("  Added SessionEnd hook: mnemon-vault push (detached)")
 else:
-    print("  SessionEnd hook already present")
+    migrated = False
+    for entry in existing:
+        for hook in entry.get("hooks", []):
+            if "mnemon-vault push" in hook.get("command", "") and hook["command"] != push_cmd:
+                hook["command"] = push_cmd
+                migrated = True
+    print("  SessionEnd hook migrated to detached push" if migrated
+          else "  SessionEnd hook already present")
 
 with open(settings_path, "w") as f:
     json.dump(settings, f, indent=2)
 
 print("  settings.json updated.")
 PYEOF
+
+if [ "$HOOKS_ONLY" -eq 1 ]; then
+    exit 0
+fi
 
 # 6. Create mnemon stores if not exist
 echo ""

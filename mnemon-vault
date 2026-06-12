@@ -18,6 +18,17 @@ fi
 GIT_HOST_URL="${GIT_HOST_URL:-}"
 GIT_HOST_USER="${GIT_HOST_USER:-}"
 
+# This script runs from Claude Code SessionStart/SessionEnd hooks, which have
+# no TTY and get cancelled if they hang. Every network call must fail fast:
+# curl gets hard timeouts, and ssh must error out instead of prompting.
+CURL_OPTS=(-sf --connect-timeout 5 --max-time 15)
+export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes -o ConnectTimeout=10}"
+
+# Public template repo and the tooling files `update` pulls from it.
+# Roster (members.txt) and data/ are never touched by an update.
+UPSTREAM_URL="${UPSTREAM_URL:-https://github.com/eszio/mnemon-vault.git}"
+TOOLING_FILES=(mnemon-vault install.sh guide.md members.txt.example README.md CONTRIBUTING.md)
+
 # ── helpers ──────────────────────────────────────────────────────────
 
 _require_age() {
@@ -40,7 +51,7 @@ _require_config() {
 _fetch_keys() {
     local user="$1"
     local keys
-    keys=$(curl -sf "${GIT_HOST_URL}/${user}.keys" 2>/dev/null) || {
+    keys=$(curl "${CURL_OPTS[@]}" "${GIT_HOST_URL}/${user}.keys" 2>/dev/null) || {
         echo "[mnemon-vault] WARNING: could not fetch keys for ${user}" >&2
         return 1
     }
@@ -57,6 +68,12 @@ _fetch_keys() {
         return 1
     fi
     echo "$usable"
+}
+
+# Probe the git host before any git/curl network work. Off-VPN / offline
+# machines must skip networking quickly rather than hang inside a hook.
+_online() {
+    curl "${CURL_OPTS[@]}" -o /dev/null "${GIT_HOST_URL}/${GIT_HOST_USER}.keys" 2>/dev/null
 }
 
 _team_recipients() {
@@ -184,8 +201,21 @@ _push_store() {
 cmd_push() {
     _require_age
     _require_config
+    if ! _online; then
+        echo "[mnemon-vault] ${GIT_HOST_URL} unreachable — skipping push" >&2
+        exit 0
+    fi
 
     cd "$SYNC_DIR"
+
+    # The web URL (load balancer) and the git remote (direct ssh, possibly a
+    # different IP) are separate paths — probe the ssh side too. Bounded by
+    # GIT_SSH_COMMAND's ConnectTimeout.
+    if ! git ls-remote --exit-code origin HEAD >/dev/null 2>&1; then
+        echo "[mnemon-vault] git remote unreachable over ssh — skipping push" >&2
+        exit 0
+    fi
+
     local changed=0
 
     # Team store
@@ -207,7 +237,14 @@ cmd_push() {
     fi
 
     if [ "$changed" -eq 0 ]; then
-        echo "[mnemon-vault] nothing to push" >&2
+        # A failed push leaves a committed-but-unpushed state while the hash
+        # files already say "no changes" — recover it here.
+        if [ -n "$(git log --oneline origin/main..HEAD 2>/dev/null)" ]; then
+            echo "[mnemon-vault] pushing commits stranded by an earlier failed push" >&2
+            git push origin main --quiet
+        else
+            echo "[mnemon-vault] nothing to push" >&2
+        fi
         return 0
     fi
 
@@ -234,7 +271,11 @@ cmd_pull() {
     _require_config
 
     cd "$SYNC_DIR"
-    git pull --rebase origin main --quiet 2>&1 | tail -1 >&2 || true
+    if _online; then
+        git pull --rebase origin main --quiet 2>&1 | tail -1 >&2 || true
+    else
+        echo "[mnemon-vault] ${GIT_HOST_URL} unreachable — importing local files only" >&2
+    fi
 
     # Collect every available SSH private key as an age identity. age tries each
     # in turn, so a device with multiple keys (ed25519 + rsa) decrypts regardless
@@ -302,6 +343,41 @@ cmd_status() {
     done
 }
 
+cmd_update() {
+    cd "$SYNC_DIR"
+
+    if ! git remote get-url upstream >/dev/null 2>&1; then
+        git remote add upstream "$UPSTREAM_URL"
+        echo "[mnemon-vault] registered upstream: $UPSTREAM_URL" >&2
+    fi
+
+    echo "[mnemon-vault] fetching upstream..." >&2
+    git fetch upstream --quiet
+
+    if git diff --quiet upstream/main -- "${TOOLING_FILES[@]}"; then
+        echo "[mnemon-vault] already up to date" >&2
+        exit 0
+    fi
+
+    git checkout upstream/main -- "${TOOLING_FILES[@]}"
+    git --no-pager diff --cached --stat -- "${TOOLING_FILES[@]}" >&2
+    git commit --quiet -m "chore: update mnemon-vault tooling from upstream" -- "${TOOLING_FILES[@]}"
+
+    if git push origin main --quiet 2>/dev/null; then
+        echo "[mnemon-vault] pushed update to team repo — other machines get it on next session" >&2
+    else
+        echo "[mnemon-vault] WARNING: could not push to origin — run 'git -C $SYNC_DIR push' when online" >&2
+    fi
+
+    # Apply Claude Code hook/settings migrations from the NEW install.sh
+    bash "$SYNC_DIR/install.sh" --hooks-only || true
+
+    echo "[mnemon-vault] update complete" >&2
+    # The checkout above rewrote this running script — exit now so bash
+    # never reads stale file offsets past this point.
+    exit 0
+}
+
 cmd_keygen() {
     _require_age
     echo "age uses your existing SSH keys — no new key needed."
@@ -319,6 +395,7 @@ case "${1:-help}" in
     pull)       cmd_pull ;;
     status)     cmd_status ;;
     configure)  cmd_configure ;;
+    update)     cmd_update ;;
     keygen)     cmd_keygen ;;
     *)
         echo "Usage: mnemon-vault <command>"
@@ -327,6 +404,7 @@ case "${1:-help}" in
         echo "  push       — export memories → encrypt → git push"
         echo "  pull       — git pull → decrypt → import into mnemon"
         echo "  status     — show sync state"
+        echo "  update     — pull tooling updates from the public template into your team repo"
         echo "  keygen     — show SSH keys to register on your git host"
         ;;
 esac
