@@ -1,0 +1,15 @@
+# members.txt — team roster (git host usernames, one per line)
+#
+# Copy this file to `members.txt` and add your team's usernames:
+#     cp members.txt.example members.txt
+#
+# Each username must have an SSH public key registered on your git host
+# (fetched from {GIT_HOST_URL}/{username}.keys). Every listed member can
+# decrypt the team store.
+#
+#   Add a member:    append their username, then: git add -f members.txt && commit && push
+#   Remove a member: delete their username, commit, push (members re-encrypt on next push)
+#
+# Example:
+# alice
+# bob

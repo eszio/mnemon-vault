@@ -1,0 +1,9 @@
+# Never commit decrypted files
+data/**/*.json
+
+# Team roster is private — never ship a real one in the public template.
+# Create it from members.txt.example; commit to your PRIVATE repo with: git add -f members.txt
+members.txt
+
+# Per-machine config (not shared)
+*.local

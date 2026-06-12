@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+# mnemon-vault — cross-device, cross-team memory sync for mnemon
+# Uses age encryption with SSH public keys fetched from your git host.
+# Per-device files guarantee zero git conflicts.
+set -euo pipefail
+
+SYNC_DIR="${MNEMON_VAULT_DIR:-$HOME/.mnemon-vault}"
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/mnemon-vault/config"
+DB_TEAM="${MNEMON_DB_TEAM:-$HOME/.mnemon/data/team/mnemon.db}"
+DB_PERSONAL="${MNEMON_DB_PERSONAL:-$HOME/.mnemon/data/personal/mnemon.db}"
+DEVICE="$(hostname -s)-$(id -un)"
+
+# Load per-machine config (GIT_HOST_USER, GIT_HOST_URL)
+if [ -f "$CONFIG_FILE" ]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+fi
+GIT_HOST_URL="${GIT_HOST_URL:-}"
+GIT_HOST_USER="${GIT_HOST_USER:-}"
+
+# ── helpers ──────────────────────────────────────────────────────────
+
+_require_age() {
+    if ! command -v age &>/dev/null; then
+        echo "[mnemon-vault] ERROR: 'age' not found. Install: sudo apt install age" >&2
+        exit 1
+    fi
+}
+
+_require_config() {
+    local missing=()
+    [ -z "$GIT_HOST_USER" ] && missing+=("GIT_HOST_USER")
+    [ -z "$GIT_HOST_URL" ]  && missing+=("GIT_HOST_URL")
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo "[mnemon-vault] ERROR: ${missing[*]} not set. Run: mnemon-vault configure" >&2
+        exit 1
+    fi
+}
+
+_fetch_keys() {
+    local user="$1"
+    local keys
+    keys=$(curl -sf "${GIT_HOST_URL}/${user}.keys" 2>/dev/null) || {
+        echo "[mnemon-vault] WARNING: could not fetch keys for ${user}" >&2
+        return 1
+    }
+    if [ -z "$keys" ]; then
+        echo "[mnemon-vault] WARNING: no keys found for ${user} on git host" >&2
+        return 1
+    fi
+    # age accepts only ssh-ed25519 and ssh-rsa recipients. Drop anything else
+    # (ecdsa, sk-*, dss) so one member's unsupported key can't break the whole push.
+    local usable
+    usable=$(printf '%s\n' "$keys" | grep -E '^(ssh-ed25519|ssh-rsa) ' || true)
+    if [ -z "$usable" ]; then
+        echo "[mnemon-vault] WARNING: ${user} has no age-compatible key (need ed25519 or rsa)" >&2
+        return 1
+    fi
+    echo "$usable"
+}
+
+_team_recipients() {
+    local members_file="$SYNC_DIR/members.txt"
+    if [ ! -f "$members_file" ]; then
+        echo "[mnemon-vault] ERROR: members.txt not found in $SYNC_DIR" >&2
+        exit 1
+    fi
+    while IFS= read -r user || [ -n "$user" ]; do
+        [[ "$user" =~ ^#|^[[:space:]]*$ ]] && continue
+        _fetch_keys "$user" || true
+    done < "$members_file"
+}
+
+_export_json() {
+    local db_path="$1"
+    python3 - "$db_path" <<'PYEOF'
+import sqlite3, json, sys, os
+
+db_path = sys.argv[1]
+if not os.path.exists(db_path):
+    print(json.dumps({"schema_version": "1", "insights": []}))
+    sys.exit(0)
+
+conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+conn.row_factory = sqlite3.Row
+
+rows = conn.execute("""
+    SELECT content, category, importance, tags, entities, source, created_at
+    FROM insights
+    WHERE deleted_at IS NULL
+    ORDER BY created_at
+""").fetchall()
+
+insights = []
+for row in rows:
+    insights.append({
+        "content": row["content"],
+        "category": row["category"],
+        "importance": int(row["importance"]),
+        "tags": json.loads(row["tags"] or "[]"),
+        "entities": json.loads(row["entities"] or "[]"),
+        "source": row["source"],
+        "created_at": row["created_at"],
+    })
+
+print(json.dumps({"schema_version": "1", "insights": insights}, ensure_ascii=False, indent=2))
+conn.close()
+PYEOF
+}
+
+# ── commands ─────────────────────────────────────────────────────────
+
+cmd_configure() {
+    echo "=== mnemon-vault configure ==="
+
+    local prompt_url="${GIT_HOST_URL:-}"
+    if [ -n "$prompt_url" ]; then
+        printf "Git host URL [%s]: " "$prompt_url"
+    else
+        printf "Git host URL (e.g. https://github.com): "
+    fi
+    read -r input_url
+    if [ -n "$input_url" ]; then
+        GIT_HOST_URL="${input_url%/}"   # strip trailing slash
+    elif [ -n "$prompt_url" ]; then
+        GIT_HOST_URL="$prompt_url"
+    else
+        echo "ERROR: Git host URL is required." >&2
+        exit 1
+    fi
+
+    printf "Your %s username: " "${GIT_HOST_URL#*://}"
+    read -r input_user
+    [ -z "$input_user" ] && { echo "ERROR: username is required." >&2; exit 1; }
+    GIT_HOST_USER="$input_user"
+
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    cat > "$CONFIG_FILE" <<EOF
+GIT_HOST_URL=${GIT_HOST_URL}
+GIT_HOST_USER=${GIT_HOST_USER}
+EOF
+    echo "Saved to $CONFIG_FILE"
+
+    # Verify key fetch
+    echo "Verifying key fetch..."
+    if _fetch_keys "$GIT_HOST_USER" > /dev/null; then
+        echo "OK — found SSH keys for ${GIT_HOST_USER}"
+    else
+        echo "WARNING: Could not fetch keys. Check username and network."
+    fi
+}
+
+_sha256() {
+    # portable: works on Linux and macOS
+    echo "$1" | python3 -c "import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())"
+}
+
+_push_store() {
+    local store="$1" db_path="$2" age_recipients="$3"
+    local json hash_file age_file stored_hash current_hash
+
+    mkdir -p "$SYNC_DIR/data/${store}"
+    age_file="$SYNC_DIR/data/${store}/insights-${DEVICE}.json.age"
+    hash_file="$SYNC_DIR/data/${store}/insights-${DEVICE}.json.sha256"
+
+    json=$(_export_json "$db_path")
+    current_hash=$(_sha256 "$json")
+
+    stored_hash=""
+    [ -f "$hash_file" ] && stored_hash=$(cat "$hash_file")
+
+    if [ "$current_hash" = "$stored_hash" ]; then
+        echo "[mnemon-vault] ${store}: no changes" >&2
+        return 1  # 1 = nothing staged
+    fi
+
+    echo "$json" | age -R <(echo "$age_recipients") -o "$age_file"
+    echo "$current_hash" > "$hash_file"
+    git add "data/${store}/insights-${DEVICE}.json.age" \
+            "data/${store}/insights-${DEVICE}.json.sha256"
+    return 0  # 0 = staged
+}
+
+cmd_push() {
+    _require_age
+    _require_config
+
+    cd "$SYNC_DIR"
+    local changed=0
+
+    # Team store
+    local recipients
+    recipients=$(_team_recipients)
+    if [ -z "$recipients" ]; then
+        echo "[mnemon-vault] ERROR: no team recipients found — aborting push" >&2
+        exit 1
+    fi
+    if _push_store "team" "$DB_TEAM" "$recipients"; then changed=1; fi
+
+    # Personal store
+    local personal_keys
+    personal_keys=$(_fetch_keys "$GIT_HOST_USER" 2>/dev/null) || personal_keys=""
+    if [ -n "$personal_keys" ]; then
+        if _push_store "personal" "$DB_PERSONAL" "$personal_keys"; then changed=1; fi
+    else
+        echo "[mnemon-vault] personal: skipping (cannot fetch own keys)" >&2
+    fi
+
+    if [ "$changed" -eq 0 ]; then
+        echo "[mnemon-vault] nothing to push" >&2
+        return 0
+    fi
+
+    # Pull before push to avoid non-fast-forward
+    git pull --rebase origin main --quiet 2>&1 | tail -1 >&2 || true
+    git commit -m "sync: ${DEVICE} $(date -Iseconds)"
+    git push origin main --quiet
+    local n
+    n=$(python3 -c "
+import json,sys,os
+f='$SYNC_DIR/data/team/insights-${DEVICE}.json.sha256'
+# count via DB not the encrypted file
+db='$DB_TEAM'
+if not os.path.exists(db): print(0); exit()
+import sqlite3
+c=sqlite3.connect(f'file:{db}?mode=ro',uri=True)
+print(c.execute('SELECT COUNT(*) FROM insights WHERE deleted_at IS NULL').fetchone()[0])
+" 2>/dev/null || echo "?")
+    echo "[mnemon-vault] pushed (team: ${n} insights, device: ${DEVICE})" >&2
+}
+
+cmd_pull() {
+    _require_age
+    _require_config
+
+    cd "$SYNC_DIR"
+    git pull --rebase origin main --quiet 2>&1 | tail -1 >&2 || true
+
+    # Collect every available SSH private key as an age identity. age tries each
+    # in turn, so a device with multiple keys (ed25519 + rsa) decrypts regardless
+    # of which key the file was encrypted to.
+    local -a age_ids=()
+    for k in ~/.ssh/id_ed25519 ~/.ssh/id_rsa ~/.ssh/id_ed25519_sk; do
+        [ -f "$k" ] && age_ids+=(-i "$k")
+    done
+    if [ ${#age_ids[@]} -eq 0 ]; then
+        echo "[mnemon-vault] ERROR: no SSH private key found in ~/.ssh (id_ed25519 / id_rsa)" >&2
+        exit 1
+    fi
+
+    # Import team memories (all devices)
+    local team_count=0
+    for f in "$SYNC_DIR/data/team/"*.json.age; do
+        [ -f "$f" ] || continue
+        local tmp
+        tmp=$(mktemp /tmp/mnemon-team-XXXXXX.json)
+        if age --decrypt "${age_ids[@]}" -o "$tmp" "$f" 2>/dev/null; then
+            if MNEMON_STORE=team mnemon import "$tmp" > /dev/null 2>&1; then team_count=$((team_count + 1)); fi
+        else
+            echo "[mnemon-vault] WARNING: could not decrypt $(basename "$f") with your keys" >&2
+        fi
+        rm -f "$tmp"
+    done
+
+    # Import own personal memories only
+    local personal_file="$SYNC_DIR/data/personal/insights-${DEVICE}.json.age"
+    local personal_count=0
+    if [ -f "$personal_file" ]; then
+        local tmp
+        tmp=$(mktemp /tmp/mnemon-personal-XXXXXX.json)
+        if age --decrypt "${age_ids[@]}" -o "$tmp" "$personal_file" 2>/dev/null; then
+            if MNEMON_STORE=personal mnemon import "$tmp" > /dev/null 2>&1; then personal_count=1; fi
+        else
+            echo "[mnemon-vault] WARNING: could not decrypt personal file with your keys" >&2
+        fi
+        rm -f "$tmp"
+    fi
+
+    echo "[mnemon-vault] pulled (team: ${team_count} device files, personal: ${personal_count})" >&2
+
+    # Output routing guide for model to read this session
+    [ -f "$SYNC_DIR/guide.md" ] && cat "$SYNC_DIR/guide.md"
+}
+
+cmd_status() {
+    echo "Sync dir    : $SYNC_DIR"
+    echo "Device      : $DEVICE"
+    echo "Git host user: ${GIT_HOST_USER:-(not configured)}"
+    echo "Git host URL : ${GIT_HOST_URL:-(not configured)}"
+    echo ""
+    cd "$SYNC_DIR" 2>/dev/null || { echo "(repo not found)"; return; }
+    echo "--- Recent commits ---"
+    git log --oneline -5 2>/dev/null || echo "(no commits yet)"
+    echo ""
+    echo "--- Team files ---"
+    for f in "$SYNC_DIR/data/team/"*.json.age; do
+        if [ -f "$f" ]; then printf "  %s\n" "$(basename "$f")"; fi
+    done
+    echo "--- Personal files ---"
+    for f in "$SYNC_DIR/data/personal/"*.json.age; do
+        if [ -f "$f" ]; then printf "  %s\n" "$(basename "$f")"; fi
+    done
+}
+
+cmd_keygen() {
+    _require_age
+    echo "age uses your existing SSH keys — no new key needed."
+    echo ""
+    echo "Your SSH public keys to register on your git host:"
+    for k in ~/.ssh/id_ed25519.pub ~/.ssh/id_rsa.pub; do
+        [ -f "$k" ] && echo "  $k: $(cat "$k")"
+    done
+    echo ""
+    echo "After adding to your git host, run: mnemon-vault configure"
+}
+
+case "${1:-help}" in
+    push)       cmd_push ;;
+    pull)       cmd_pull ;;
+    status)     cmd_status ;;
+    configure)  cmd_configure ;;
+    keygen)     cmd_keygen ;;
+    *)
+        echo "Usage: mnemon-vault <command>"
+        echo ""
+        echo "  configure  — set git host URL and username for this machine (run once)"
+        echo "  push       — export memories → encrypt → git push"
+        echo "  pull       — git pull → decrypt → import into mnemon"
+        echo "  status     — show sync state"
+        echo "  keygen     — show SSH keys to register on your git host"
+        ;;
+esac
