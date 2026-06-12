@@ -463,7 +463,8 @@ cmd_setup_agent() {
         echo "[mnemon-vault] recipient already present in ${recipients_file}"
     else
         echo "$recipient" >> "$recipients_file"
-        git -C "$SYNC_DIR" add "recipients/${GIT_HOST_USER}.txt"
+        # recipients/*.txt is gitignored in the public template; force-add to track it in the private repo
+        git -C "$SYNC_DIR" add -f "recipients/${GIT_HOST_USER}.txt"
         if git -C "$SYNC_DIR" commit -m "chore(recipients): add sshagent recipient for ${GIT_HOST_USER} (${DEVICE})"; then
             if ! git -C "$SYNC_DIR" push origin main --quiet 2>/dev/null; then
                 echo "[mnemon-vault] WARNING: could not push to origin — run 'git -C $SYNC_DIR push' when online" >&2

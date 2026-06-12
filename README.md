@@ -177,7 +177,7 @@ mnemon-vault setup-agent
 
 This will:
 1. Generate an identity file at `~/.config/mnemon-vault/identity.txt` (contains no secret material — only a public token used to request a signature from your agent)
-2. Derive the corresponding `age1...` recipient and append it to `recipients/<your-username>.txt` in the team repo
+2. Derive the corresponding `age1...` recipient and append it to `recipients/<your-username>.txt` in the team repo (gitignored in the public template — setup-agent force-adds it automatically, no manual `git add -f` needed)
 3. Commit and push the recipient — teammates' next `push` will automatically encrypt to it
 
 **Prerequisites:**
@@ -255,7 +255,7 @@ git push
 ├── guide.md                             ← AI routing instructions (output at SessionStart)
 ├── .gitignore                           ← excludes decrypted .json files + members.txt
 ├── recipients/
-│   └── {username}.txt                   ← age recipients for each member (age1... lines); used when ssh key alone is insufficient (e.g. sshagent plugin)
+│   └── {username}.txt                   ← age recipients for each member (age1... lines); used when ssh key alone is insufficient (e.g. sshagent plugin) (gitignored; setup-agent force-adds it in your private repo)
 └── data/
     ├── team/
     │   ├── insights-{device}.json.age     ← encrypted team memories
