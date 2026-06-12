@@ -86,7 +86,7 @@ Ciphertext is written **once** regardless of team size — O(1) storage per devi
 2. Clone this repo, point it at your private repo, and create the team roster:
 
 ```bash
-git clone <mnemon-vault-repo-url> ~/.mnemon-vault
+git clone https://github.com/eszio/mnemon-vault.git ~/.mnemon-vault
 cd ~/.mnemon-vault
 git remote set-url origin git@github.com:your-org/mnemon-memories.git
 
@@ -121,17 +121,35 @@ git clone git@github.com:your-org/mnemon-memories.git ~/.mnemon-vault
 6. Set `MNEMON_STORE=team` as default in Claude Code settings
 7. Import all existing team memories
 
-### Receiving upstream fixes
-
-To pull script improvements from this template without touching your data:
+### Updating to a new version
 
 ```bash
-git remote add upstream <mnemon-vault-repo-url>
-git fetch upstream
-# Check out only the tooling — never the roster or data
-git checkout upstream/main -- mnemon-vault install.sh guide.md members.txt.example README.md CONTRIBUTING.md
-git commit -m "chore: update mnemon-vault scripts from upstream"
+mnemon-vault update
 ```
+
+This pulls the latest tooling from the public template into your private team repo — your roster (`members.txt`) and encrypted data are never touched. It automatically:
+
+1. Registers `https://github.com/eszio/mnemon-vault.git` as the `upstream` remote (first run only)
+2. Fetches upstream and checks out only the tooling files (`mnemon-vault`, `install.sh`, `guide.md`, `members.txt.example`, `README.md`, `CONTRIBUTING.md`)
+3. Commits and pushes to your private repo — **the whole team receives the update**
+4. Applies any Claude Code hook/settings migrations (`install.sh --hooks-only`)
+
+Other machines pick up the new script automatically on their next session (the `SessionStart` pull). If the release notes mention changes to Claude Code hooks, run `~/.mnemon-vault/install.sh --hooks-only` on each machine once — it migrates `settings.json` in place, no prompts.
+
+<details>
+<summary>Manual equivalent</summary>
+
+```bash
+cd ~/.mnemon-vault
+git remote add upstream https://github.com/eszio/mnemon-vault.git   # first time only
+git fetch upstream
+git checkout upstream/main -- mnemon-vault install.sh guide.md members.txt.example README.md CONTRIBUTING.md
+git commit -m "chore: update mnemon-vault tooling from upstream"
+git push
+./install.sh --hooks-only
+```
+
+</details>
 
 ---
 
@@ -142,6 +160,7 @@ mnemon-vault configure   # set git host URL and username (once per machine)
 mnemon-vault push        # export → encrypt → push to git
 mnemon-vault pull        # git pull → decrypt → import into mnemon
 mnemon-vault status      # show sync state, device files, recent commits
+mnemon-vault update      # pull tooling updates from the public template
 mnemon-vault keygen      # show which SSH keys will be used
 ```
 
