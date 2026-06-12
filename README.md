@@ -156,13 +156,42 @@ git push
 ## Usage
 
 ```bash
-mnemon-vault configure   # set git host URL and username (once per machine)
-mnemon-vault push        # export → encrypt → push to git
-mnemon-vault pull        # git pull → decrypt → import into mnemon
-mnemon-vault status      # show sync state, device files, recent commits
-mnemon-vault update      # pull tooling updates from the public template
-mnemon-vault keygen      # show which SSH keys will be used
+mnemon-vault configure     # set git host URL and username (once per machine)
+mnemon-vault push          # export → encrypt → push to git
+mnemon-vault pull          # git pull → decrypt → import into mnemon
+mnemon-vault status        # show sync state, device files, recent commits
+mnemon-vault update        # pull tooling updates from the public template
+mnemon-vault keygen        # show which SSH keys will be used
+mnemon-vault setup-agent   # use an ssh-agent-derived identity for decryption (requires age-plugin-sshagent)
 ```
+
+### Decrypting via ssh-agent (passphrase-protected keys)
+
+**Problem:** `age` decrypts your memories at `SessionStart` inside a Claude Code hook — there is no TTY, so it cannot prompt for an SSH key passphrase. Decryption silently fails for every team member with a passphrase-protected key.
+
+**Solution:** [age-plugin-sshagent](https://github.com/eszio/age-plugin-sshagent) derives a stable decryption key from a deterministic signature made by your SSH agent. No passphrase prompt is needed — the agent signs silently.
+
+```bash
+mnemon-vault setup-agent
+```
+
+This will:
+1. Generate an identity file at `~/.config/mnemon-vault/identity.txt` (contains no secret material — only a public token used to request a signature from your agent)
+2. Derive the corresponding `age1...` recipient and append it to `recipients/<your-username>.txt` in the team repo (gitignored in the public template — setup-agent force-adds it automatically, no manual `git add -f` needed)
+3. Commit and push the recipient — teammates' next `push` will automatically encrypt to it
+
+**Prerequisites:**
+- `age` >= 1.1.0
+- `age-plugin-sshagent` binary in `PATH`:
+  ```bash
+  go install github.com/eszio/age-plugin-sshagent@latest
+  # or download from https://github.com/eszio/age-plugin-sshagent/releases
+  ```
+- SSH agent running with your key loaded (`ssh-add ~/.ssh/id_ed25519`)
+
+**Security note:** Anyone with access to your SSH agent (including via agent forwarding) can derive this decryption key.
+
+---
 
 ### Memory commands (Claude Code)
 
@@ -225,6 +254,8 @@ git push
 ├── members.txt                          ← your team roster (gitignored; force-add in private repo)
 ├── guide.md                             ← AI routing instructions (output at SessionStart)
 ├── .gitignore                           ← excludes decrypted .json files + members.txt
+├── recipients/
+│   └── {username}.txt                   ← age recipients for each member (age1... lines); used when ssh key alone is insufficient (e.g. sshagent plugin) (gitignored; setup-agent force-adds it in your private repo)
 └── data/
     ├── team/
     │   ├── insights-{device}.json.age     ← encrypted team memories
