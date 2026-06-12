@@ -128,12 +128,13 @@ rows = conn.execute("""
 
 insights = []
 for row in rows:
+    # mnemon import rejects the whole draft when an insight exceeds 50 entities, so cap defensively.
     insights.append({
         "content": row["content"],
         "category": row["category"],
         "importance": int(row["importance"]),
-        "tags": json.loads(row["tags"] or "[]"),
-        "entities": json.loads(row["entities"] or "[]"),
+        "tags": json.loads(row["tags"] or "[]")[:50],
+        "entities": json.loads(row["entities"] or "[]")[:50],
         "source": row["source"],
         "created_at": row["created_at"],
     })
@@ -336,7 +337,11 @@ cmd_pull() {
         tmp=$(mktemp /tmp/mnemon-team-XXXXXX.json)
         if _decrypt_with_candidates "$tmp" "$f" "${id_candidates[@]}"; then
             team_decrypted=$((team_decrypted + 1))
-            if MNEMON_STORE=team mnemon import "$tmp" > /dev/null 2>&1; then team_count=$((team_count + 1)); fi
+            if MNEMON_STORE=team mnemon import "$tmp" > /dev/null 2>&1; then
+                team_count=$((team_count + 1))
+            else
+                echo "[mnemon-vault] WARNING: import failed for $(basename "$f") — run: mnemon import <file> to see why" >&2
+            fi
         else
             echo "[mnemon-vault] WARNING: could not decrypt $(basename "$f") with your keys" >&2
         fi
@@ -350,7 +355,11 @@ cmd_pull() {
         local tmp
         tmp=$(mktemp /tmp/mnemon-personal-XXXXXX.json)
         if _decrypt_with_candidates "$tmp" "$personal_file" "${id_candidates[@]}"; then
-            if MNEMON_STORE=personal mnemon import "$tmp" > /dev/null 2>&1; then personal_count=1; fi
+            if MNEMON_STORE=personal mnemon import "$tmp" > /dev/null 2>&1; then
+                personal_count=1
+            else
+                echo "[mnemon-vault] WARNING: import failed for personal file — run: mnemon import <file> to see why" >&2
+            fi
         else
             echo "[mnemon-vault] WARNING: could not decrypt personal file with your keys" >&2
         fi
